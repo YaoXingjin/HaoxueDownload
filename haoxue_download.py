@@ -9,9 +9,10 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from html.parser import HTMLParser
 from pathlib import Path
-from urllib.parse import quote, urlsplit
+from urllib.parse import quote, urljoin, urlsplit, urlunsplit
 
 import requests
 from Crypto.Cipher import PKCS1_v1_5
@@ -242,21 +243,252 @@ def run_ffmpeg_with_progress(command: list[str], duration: float) -> int:
     stderr = None if VERBOSE else subprocess.DEVNULL
     process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=stderr, text=True, bufsize=1)
     current = 0.0
+    started_at = time.monotonic()
     if process.stdout:
         for line in process.stdout:
             key, _, value = line.strip().partition("=")
             if key == "out_time_ms":
                 current = int(value or 0) / 1_000_000
+                elapsed = time.monotonic() - started_at
                 if duration > 0:
                     ratio = min(current / duration, 1.0)
                     width = 32
                     bar = "#" * int(width * ratio) + "-" * (width - int(width * ratio))
-                    print(f"\rffmpeg [{bar}] {ratio * 100:5.1f}% {format_time(current)}/{format_time(duration)}", end="", flush=True)
+                    eta = elapsed * (duration / current - 1) if current > 0 else 0
+                    print(
+                        f"\rffmpeg [{bar}] {ratio * 100:5.1f}% "
+                        f"processed {format_time(current)}/{format_time(duration)} "
+                        f"elapsed {format_time(elapsed)} ETA {format_time(eta)}",
+                        end="", flush=True,
+                    )
                 else:
-                    print(f"\rffmpeg {format_time(current)}", end="", flush=True)
+                    print(
+                        f"\rffmpeg processed {format_time(current)} "
+                        f"elapsed {format_time(elapsed)}",
+                        end="", flush=True,
+                    )
     code = process.wait()
     print()
     return code
+
+
+def playlist_identity(body: str, playlist_url: str) -> str:
+    """Return an identity that survives changes to expiring URL query strings."""
+    normalized: list[str] = []
+    for raw_line in body.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line.startswith("#"):
+            line = re.sub(
+                r'URI="([^"]+)"',
+                lambda match: 'URI="' + urlunsplit(
+                    (*urlsplit(urljoin(playlist_url, match.group(1)))[:3], "", "")
+                ) + '"',
+                line,
+            )
+            normalized.append(line)
+            continue
+        absolute = urlsplit(urljoin(playlist_url, line))
+        normalized.append(urlunsplit((absolute.scheme, absolute.netloc, absolute.path, "", "")))
+    return hashlib.sha256("\n".join(normalized).encode()).hexdigest()
+
+
+def fetch_media_playlist(
+    session: requests.Session, playlist_url: str, headers: dict[str, str], depth: int = 0,
+) -> tuple[str, str]:
+    """Resolve a master playlist to its highest-bandwidth media playlist."""
+    if depth > 5:
+        raise RuntimeError("HLS playlist nesting is too deep")
+    response = session.get(
+        playlist_url, headers={"User-Agent": UA, **headers}, timeout=30,
+        allow_redirects=True,
+    )
+    response.raise_for_status()
+    body = response.text
+    lines = [line.strip() for line in body.splitlines() if line.strip()]
+    variants: list[tuple[int, str]] = []
+    for index, line in enumerate(lines):
+        if not line.startswith("#EXT-X-STREAM-INF:"):
+            continue
+        match = re.search(r"(?:^|,)BANDWIDTH=(\d+)", line)
+        bandwidth = int(match.group(1)) if match else 0
+        if index + 1 < len(lines) and not lines[index + 1].startswith("#"):
+            variants.append((bandwidth, urljoin(response.url, lines[index + 1])))
+    if variants:
+        _, selected_url = max(variants, key=lambda item: item[0])
+        debug(f"Selected HLS variant from {len(variants)} choices")
+        return fetch_media_playlist(session, selected_url, headers, depth + 1)
+    return response.url, body
+
+
+def download_cached_resource(
+    session: requests.Session, url: str, destination: Path, headers: dict[str, str],
+) -> bool:
+    """Download one resource atomically. Return False when it was cached."""
+    if destination.is_file() and destination.stat().st_size > 0:
+        return False
+    temporary = destination.with_name(destination.name + ".part")
+    try:
+        with session.get(
+            url, headers={"User-Agent": UA, **headers}, timeout=30,
+            allow_redirects=True, stream=True,
+        ) as response:
+            response.raise_for_status()
+            expected = int(response.headers.get("Content-Length", "0") or 0)
+            written = 0
+            with temporary.open("wb") as output:
+                for chunk in response.iter_content(chunk_size=1024 * 256):
+                    if chunk:
+                        output.write(chunk)
+                        written += len(chunk)
+        if written == 0 or (expected and written != expected):
+            raise IOError(f"incomplete response: expected {expected}, received {written}")
+        temporary.replace(destination)
+        return True
+    except Exception:
+        temporary.unlink(missing_ok=True)
+        raise
+
+
+def cache_hls_playlist(
+    session: requests.Session, playlist_url: str, body: str, cache_dir: Path,
+    headers: dict[str, str],
+) -> tuple[Path, int, int]:
+    """Cache HLS resources and write a playlist that refers only to local files."""
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    identity_file = cache_dir / "playlist.sha256"
+    identity = playlist_identity(body, playlist_url)
+    if identity_file.exists() and identity_file.read_text(encoding="ascii").strip() != identity:
+        raise RuntimeError(
+            f"playlist differs from the cache in {cache_dir}; choose another output "
+            "name or remove that cache directory"
+        )
+    identity_file.write_text(identity + "\n", encoding="ascii")
+
+    lines = body.splitlines()
+    segment_urls = []
+    segment_durations = []
+    pending_duration = 0.0
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("#EXTINF:"):
+            match = re.match(r"#EXTINF:([0-9]+(?:\.[0-9]+)?)", stripped)
+            pending_duration = float(match.group(1)) if match else 0.0
+        elif stripped and not stripped.startswith("#"):
+            segment_urls.append(urljoin(playlist_url, stripped))
+            segment_durations.append(pending_duration)
+            pending_duration = 0.0
+    total = len(segment_urls)
+    if not total:
+        raise RuntimeError("media playlist contains no segments")
+
+    local_lines: list[str] = []
+    downloaded = 0
+    ready_duration = 0.0
+    total_duration = sum(segment_durations)
+    started_at = time.monotonic()
+    segment_index = 0
+    auxiliary_names: dict[str, str] = {}
+    segment_names: dict[str, str] = {}
+
+    def cache_auxiliary(remote_url: str, kind: str) -> str:
+        nonlocal downloaded
+        absolute_url = urljoin(playlist_url, remote_url)
+        if absolute_url not in auxiliary_names:
+            suffix = Path(urlsplit(absolute_url).path).suffix or ".bin"
+            name = f"{kind}_{len(auxiliary_names) + 1:03d}{suffix}"
+            if download_cached_resource(session, absolute_url, cache_dir / name, headers):
+                downloaded += 1
+            auxiliary_names[absolute_url] = name
+        return auxiliary_names[absolute_url]
+
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line.startswith("#EXT-X-KEY:") and 'URI="' in line:
+            line = re.sub(
+                r'URI="([^"]+)"',
+                lambda match: f'URI="{cache_auxiliary(match.group(1), "key")}"',
+                line,
+            )
+        elif line.startswith("#EXT-X-MAP:") and 'URI="' in line:
+            line = re.sub(
+                r'URI="([^"]+)"',
+                lambda match: f'URI="{cache_auxiliary(match.group(1), "init")}"',
+                line,
+            )
+        elif not line.startswith("#"):
+            segment_index += 1
+            remote_url = urljoin(playlist_url, line)
+            local_name = segment_names.get(remote_url)
+            was_downloaded = False
+            if local_name is None:
+                suffix = Path(urlsplit(remote_url).path).suffix or ".ts"
+                local_name = f"segment_{segment_index:06d}{suffix}"
+                segment_names[remote_url] = local_name
+                was_downloaded = download_cached_resource(
+                    session, remote_url, cache_dir / local_name, headers,
+                )
+            if was_downloaded:
+                downloaded += 1
+            ready_duration += segment_durations[segment_index - 1]
+            state = "downloaded" if was_downloaded else "cached"
+            elapsed = time.monotonic() - started_at
+            eta = (
+                elapsed * (total_duration / ready_duration - 1)
+                if ready_duration > 0 else 0
+            )
+            print(
+                f"\rSegments: {segment_index}/{total} ({state}) "
+                f"ready {format_time(ready_duration)}/{format_time(total_duration)} "
+                f"elapsed {format_time(elapsed)} ETA {format_time(eta)}",
+                end="", flush=True,
+            )
+            line = local_name
+        local_lines.append(line)
+    print()
+
+    local_playlist = cache_dir / "local.m3u8"
+    local_playlist.write_text("\n".join(local_lines) + "\n", encoding="utf-8")
+    return local_playlist, downloaded, total
+
+
+def resumable_hls_download(
+    session: requests.Session, media_url: str, media_cookie: str,
+    output_path: Path, ffmpeg: str,
+) -> None:
+    output_path = output_path.resolve()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    cache_dir = output_path.parent / f"{output_path.name}.segments"
+    headers = {"Cookie": f"_token={media_cookie}"}
+    playlist_url, body = fetch_media_playlist(session, media_url, headers)
+    duration = playlist_duration(body)
+    local_playlist, downloaded, total = cache_hls_playlist(
+        session, playlist_url, body, cache_dir, headers,
+    )
+    print(f"Segments ready: {total}; downloaded now: {downloaded}; cache: {cache_dir}")
+
+    temporary_output = output_path.with_name(
+        output_path.stem + ".part" + (output_path.suffix or ".mp4")
+    )
+    command = [
+        ffmpeg, "-hide_banner", "-y", "-protocol_whitelist", "file,crypto,data",
+        "-allowed_extensions", "ALL",
+        "-i", str(local_playlist), "-c", "copy", str(temporary_output),
+    ]
+    print("Joining cached segments with ffmpeg.")
+    result_code = run_ffmpeg_with_progress(command, duration)
+    print("ffmpeg exit code:", result_code)
+    if result_code != 0:
+        temporary_output.unlink(missing_ok=True)
+        print("Join failed; cached segments were kept for the next run.")
+        return
+    temporary_output.replace(output_path)
+    shutil.rmtree(cache_dir)
+    print("Saved:", output_path)
+    print("Segment cache removed.")
 
 
 def fetch_all_courses(session: requests.Session, search: str, api_token: str) -> list[dict]:
@@ -420,6 +652,10 @@ def main(argv: list[str] | None = None) -> int:
         show_response(response, response.text)
         subject_data = json_data(response)
         print_sub_records(subject_data)
+        subject_container = subject_data
+        if isinstance(subject_container, dict) and isinstance(subject_container.get("data"), dict):
+            subject_container = subject_container["data"]
+        subjects = subject_container.get("sub_list", []) if isinstance(subject_container, dict) else []
         subject_id = input("sub_id to inspect (empty to stop): ").strip()
         if subject_id:
             response = course_api(
@@ -471,7 +707,7 @@ def probe_and_optionally_download(
     else:
         print("Playlist request failed; download skipped.")
         return
-    answer = input("Download this replay with ffmpeg? [y/N]: ").strip().lower()
+    answer = input("Download/resume this replay? [y/N]: ").strip().lower()
     if answer != "y":
         return
     ffmpeg = shutil.which("ffmpeg")
@@ -480,16 +716,7 @@ def probe_and_optionally_download(
         return
     output = input(f"Output file [{default_name}]: ").strip() or default_name
     output_path = Path(output).expanduser()
-    cookie_header = f"Cookie: _token={media_cookie}\r\n"
-    command = [
-        ffmpeg, "-hide_banner", "-y", "-headers", cookie_header,
-        "-i", media_url, "-c", "copy", str(output_path),
-    ]
-    print("Starting ffmpeg; URL and cookie are hidden.")
-    result_code = run_ffmpeg_with_progress(command, duration)
-    print("ffmpeg exit code:", result_code)
-    if result_code == 0:
-        print("Saved:", output_path.resolve())
+    resumable_hls_download(session, media_url, media_cookie, output_path, ffmpeg)
 
 
 if __name__ == "__main__":

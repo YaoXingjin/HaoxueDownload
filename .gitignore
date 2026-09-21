@@ -5,6 +5,7 @@ __pycache__/
 
 # Downloaded media and temporary output
 *.mp4
+*.mp4.segments/
 
 # Local project memory (keep out of upstream repositories)
 PROJECT_MEMORY.md
