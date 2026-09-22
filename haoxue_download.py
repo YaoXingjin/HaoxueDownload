@@ -166,6 +166,30 @@ def print_course_records(data) -> None:
         )
 
 
+def select_record_value(records: list, prompt: str, id_key: str) -> str:
+    """Accept either the displayed 1-based index or the record's existing ID."""
+    if not isinstance(records, list):
+        print(f"No selectable records for {id_key}.")
+        return ""
+    choice = input(prompt).strip()
+    if not choice:
+        return ""
+    # Prefer an exact ID match so numeric IDs are not mistaken for list indexes.
+    for item in records:
+        if isinstance(item, dict) and str(item.get(id_key, "")).strip() == choice:
+            return choice
+    try:
+        index = int(choice)
+    except ValueError:
+        index = 0
+    if 1 <= index <= len(records) and isinstance(records[index - 1], dict):
+        value = records[index - 1].get(id_key)
+        if value is not None and str(value).strip():
+            return str(value).strip()
+    print(f"No matching {id_key}: {choice}")
+    return ""
+
+
 def print_sub_records(data) -> None:
     # get-course-detail maps to PlaybackVideoListBean.Data, whose subject
     # collection is named sub_list (the course-list endpoint uses lists).
@@ -364,6 +388,7 @@ def cache_hls_playlist(
             f"playlist differs from the cache in {cache_dir}; choose another output "
             "name or remove that cache directory"
         )
+
     identity_file.write_text(identity + "\n", encoding="ascii")
 
     lines = body.splitlines()
@@ -641,7 +666,11 @@ def main(argv: list[str] | None = None) -> int:
     search = input("Course search (empty for all): ")
     course_records = fetch_all_courses(session, search, api_token)
     print_course_records({"lists": course_records})
-    course_id = input("course_id to inspect (empty to stop): ").strip()
+    course_id = select_record_value(
+        course_records,
+        "Course number or course_id to inspect (empty to stop): ",
+        "course_id",
+    )
     if course_id:
         response = course_api(
             session,
@@ -656,7 +685,13 @@ def main(argv: list[str] | None = None) -> int:
         if isinstance(subject_container, dict) and isinstance(subject_container.get("data"), dict):
             subject_container = subject_container["data"]
         subjects = subject_container.get("sub_list", []) if isinstance(subject_container, dict) else []
-        subject_id = input("sub_id to inspect (empty to stop): ").strip()
+        if not isinstance(subjects, list):
+            subjects = []
+        subject_id = select_record_value(
+            subjects,
+            "Lesson number or sub_id to inspect (empty to stop): ",
+            "id",
+        )
         if subject_id:
             response = course_api(
                 session,
