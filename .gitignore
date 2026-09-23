@@ -9,4 +9,3 @@ __pycache__/
 
 # Local project memory (keep out of upstream repositories)
 PROJECT_MEMORY.md
-/tests
