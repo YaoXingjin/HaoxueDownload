@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import sys
 import time
+from datetime import date, timedelta
 from html.parser import HTMLParser
 from pathlib import Path
 from urllib.parse import quote, urljoin, urlsplit, urlunsplit
@@ -23,6 +24,15 @@ UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/135 Sa
 PASSPORT = "https://passport.pku.edu.cn"
 IAAA = "https://iaaa.pku.edu.cn/iaaa"
 VERBOSE = False
+
+PLAYBACK_STATUS_LABELS = {
+    "1": "live",
+    "2": "not started",
+    "3": "replay generating",
+    "4": "no access",
+    "5": "replay unavailable",
+    "6": "replay available",
+}
 
 
 def debug(*args, **kwargs) -> None:
@@ -166,6 +176,19 @@ def print_course_records(data) -> None:
         )
 
 
+def print_date_records(records: list[dict]) -> None:
+    print(f"Date records: {len(records)}")
+    for index, item in enumerate(records, 1):
+        status = str(item.get("sub_status", ""))
+        print(
+            f"  [{index}] course={item.get('course_name')}, "
+            f"lesson={item.get('sub_name')}, teacher={item.get('course_teacher')}, "
+            f"room={item.get('room_name')}, start={item.get('start_at')}, "
+            f"end={item.get('end_at')}, status={status} "
+            f"({PLAYBACK_STATUS_LABELS.get(status, 'unknown')})"
+        )
+
+
 def select_record_value(records: list, prompt: str, id_key: str) -> str:
     """Accept either the displayed 1-based index or the record's existing ID."""
     if not isinstance(records, list):
@@ -188,6 +211,20 @@ def select_record_value(records: list, prompt: str, id_key: str) -> str:
             return str(value).strip()
     print(f"No matching {id_key}: {choice}")
     return ""
+
+
+def select_record_by_index(records: list[dict], prompt: str) -> dict | None:
+    choice = input(prompt).strip()
+    if not choice:
+        return None
+    try:
+        index = int(choice)
+    except ValueError:
+        index = 0
+    if 1 <= index <= len(records):
+        return records[index - 1]
+    print(f"No matching record: {choice}")
+    return None
 
 
 def print_sub_records(data) -> None:
@@ -561,6 +598,86 @@ def fetch_all_courses(session: requests.Session, search: str, api_token: str) ->
     return records
 
 
+def fetch_all_lessons_by_date(
+    session: requests.Session, course_date: str, api_token: str,
+) -> list[dict]:
+    """Fetch every replay record exposed by the app's date-search endpoint."""
+    records: list[dict] = []
+    seen: set[tuple[str, str, str]] = set()
+    page = 1
+    while True:
+        response = course_api(
+            session,
+            "v3/course/get-use-member-sub",
+            {"course_time": course_date, "page": str(page)},
+            api_token,
+        )
+        data = json_data(response)
+        container = data.get("data", data) if isinstance(data, dict) else {}
+        page_records = container.get("lists", []) if isinstance(container, dict) else []
+        if not isinstance(page_records, list):
+            page_records = []
+
+        added = 0
+        for item in page_records:
+            if not isinstance(item, dict):
+                continue
+            identity = (
+                str(item.get("course_id", "")),
+                str(item.get("sub_id", "")),
+                str(item.get("start_at", "")),
+            )
+            if identity not in seen:
+                seen.add(identity)
+                records.append(item)
+                added += 1
+
+        has_next_value = data.get("hasNextPage") if isinstance(data, dict) else None
+        if has_next_value is None and isinstance(container, dict):
+            has_next_value = container.get("hasNextPage")
+        has_next = bool(has_next_value)
+        page_size_value = container.get("pageSize") if isinstance(container, dict) else None
+        try:
+            page_size = int(page_size_value)
+        except (TypeError, ValueError):
+            page_size = 10
+        full_page = len(page_records) >= max(page_size, 10)
+        debug(
+            f"Date page {page}: received={len(page_records)}, added={added}, "
+            f"pageSize={page_size}, hasNextPage={has_next}, "
+            f"full-page-fallback={full_page}"
+        )
+        if not page_records or added == 0 or not (has_next or full_page):
+            break
+        page += 1
+    return records
+
+
+def offer_subject_download(
+    session: requests.Session, api_token: str, media_cookie: str,
+    course_id: str, subject_id: str, course_name: str = "",
+    replay_title: str = "",
+) -> None:
+    response = course_api(
+        session,
+        "v3/course/get-course-sub-detail",
+        {"course_id": course_id, "sub_id": subject_id},
+        api_token,
+    )
+    show_response(response, response.text)
+    video_data = json_data(response)
+    media_url = print_video_info(video_data)
+    video_record = video_data.get("data", video_data) if isinstance(video_data, dict) else {}
+    if isinstance(video_record, dict):
+        course_name = str(video_record.get("course_name") or course_name)
+        replay_title = str(video_record.get("title") or replay_title)
+    default_name = safe_filename(
+        f"{course_name or course_id}_{replay_title or subject_id}"
+    ) + ".mp4"
+    debug("Media Cookie available:", "yes (value hidden)" if media_cookie else "no")
+    probe_and_optionally_download(session, media_url, media_cookie, default_name)
+
+
 def main(argv: list[str] | None = None) -> int:
     global VERBOSE
     parser = argparse.ArgumentParser(description="Debug PKU playback login and download replay")
@@ -663,56 +780,90 @@ def main(argv: list[str] | None = None) -> int:
     api_token = next((c.value for c in session.cookies if c.name == "_token2"), "")
     media_cookie = next((c.value for c in session.cookies if c.name == "_token"), "")
     debug("== 7. Course and playback probe ==")
-    search = input("Course search (empty for all): ")
-    course_records = fetch_all_courses(session, search, api_token)
-    print_course_records({"lists": course_records})
-    course_id = select_record_value(
-        course_records,
-        "Course number or course_id to inspect (empty to stop): ",
-        "course_id",
-    )
-    if course_id:
-        response = course_api(
-            session,
-            "v3/course/get-course-detail",
-            {"course_id": course_id},
-            api_token,
+    find_mode = input("Find replay by [1] course or [2] date : ").strip().lower()
+    if find_mode in {"2", "d", "date"}:
+        default_date = (date.today() - timedelta(days=1)).isoformat()
+        course_date = input(f"Course date YYYY-MM-DD [{default_date}]: ").strip() or default_date
+        try:
+            if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", course_date):
+                raise ValueError
+            course_date = date.fromisoformat(course_date).isoformat()
+        except ValueError:
+            print(f"Invalid date: {course_date}. Expected YYYY-MM-DD.")
+            return 2
+        date_records = fetch_all_lessons_by_date(session, course_date, api_token)
+        print_date_records(date_records)
+        selected = select_record_by_index(
+            date_records,
+            "Record number to inspect (empty to stop): ",
         )
-        show_response(response, response.text)
-        subject_data = json_data(response)
-        print_sub_records(subject_data)
-        subject_container = subject_data
-        if isinstance(subject_container, dict) and isinstance(subject_container.get("data"), dict):
-            subject_container = subject_container["data"]
-        subjects = subject_container.get("sub_list", []) if isinstance(subject_container, dict) else []
-        if not isinstance(subjects, list):
-            subjects = []
-        subject_id = select_record_value(
-            subjects,
-            "Lesson number or sub_id to inspect (empty to stop): ",
-            "id",
+        if selected:
+            status = str(selected.get("sub_status", ""))
+            if status != "6":
+                print(
+                    "This lesson cannot be opened as a replay: "
+                    f"status={status} ({PLAYBACK_STATUS_LABELS.get(status, 'unknown')})."
+                )
+            else:
+                offer_subject_download(
+                    session,
+                    api_token,
+                    media_cookie,
+                    str(selected.get("course_id", "")),
+                    str(selected.get("sub_id", "")),
+                    str(selected.get("course_name", "")),
+                    str(selected.get("sub_name", "")),
+                )
+    else:
+        search = input("Course search (empty for all): ")
+        course_records = fetch_all_courses(session, search, api_token)
+        print_course_records({"lists": course_records})
+        course_id = select_record_value(
+            course_records,
+            "Course number or course_id to inspect (empty to stop): ",
+            "course_id",
         )
-        if subject_id:
+        if course_id:
             response = course_api(
                 session,
-                "v3/course/get-course-sub-detail",
-                {"course_id": course_id, "sub_id": subject_id},
+                "v3/course/get-course-detail",
+                {"course_id": course_id},
                 api_token,
             )
             show_response(response, response.text)
-            video_data = json_data(response)
-            media_url = print_video_info(video_data)
-            course_name = video_data.get("course_name") if isinstance(video_data, dict) else None
-            replay_title = video_data.get("title") if isinstance(video_data, dict) else None
-            if not replay_title:
+            subject_data = json_data(response)
+            print_sub_records(subject_data)
+            subject_container = subject_data
+            if isinstance(subject_container, dict) and isinstance(subject_container.get("data"), dict):
+                subject_container = subject_container["data"]
+            subjects = subject_container.get("sub_list", []) if isinstance(subject_container, dict) else []
+            if not isinstance(subjects, list):
+                subjects = []
+            subject_id = select_record_value(
+                subjects,
+                "Lesson number or sub_id to inspect (empty to stop): ",
+                "id",
+            )
+            if subject_id:
                 replay_title = next(
-                    (item.get("sub_title") for item in subjects
+                    (str(item.get("sub_title") or "") for item in subjects
                      if isinstance(item, dict) and str(item.get("id")) == subject_id),
-                    subject_id,
+                    "",
                 )
-            default_name = safe_filename(f"{course_name or course_id}_{replay_title}") + ".mp4"
-            debug("Media Cookie available:", "yes (value hidden)" if media_cookie else "no")
-            probe_and_optionally_download(session, media_url, media_cookie, default_name)
+                selected_course_name = next(
+                    (str(item.get("course_name") or "") for item in course_records
+                     if isinstance(item, dict) and str(item.get("course_id")) == course_id),
+                    "",
+                )
+                offer_subject_download(
+                    session,
+                    api_token,
+                    media_cookie,
+                    course_id,
+                    subject_id,
+                    selected_course_name,
+                    replay_title,
+                )
     print("Done. No password, token, or cookie value was printed.")
     return 0
 
