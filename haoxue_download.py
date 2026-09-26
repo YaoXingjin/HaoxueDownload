@@ -319,20 +319,25 @@ def select_record_value(records: list, prompt: str, id_key: str) -> str:
     return ""
 
 
-def print_sub_records(data) -> None:
+def print_sub_records(data, hidden_subjects: list | None = None) -> None:
     # get-course-detail maps to PlaybackVideoListBean.Data, whose subject
     # collection is named sub_list (the course-list endpoint uses lists).
     if isinstance(data, dict) and isinstance(data.get("data"), dict):
         data = data["data"]
     records = data.get("sub_list", []) if isinstance(data, dict) else []
-    print(f"Subject records: {len(records)}")
-    for index, item in enumerate(records, 1):
+    all_records = list(records) + (hidden_subjects or [])
+    hidden_count = len(hidden_subjects) if hidden_subjects else 0
+    print(f"Subject records: {len(records)} (+{hidden_count} hidden)")
+    for index, item in enumerate(all_records, 1):
         if not isinstance(item, dict):
             continue
+        hidden_tag = " [hidden]" if item.get("_hidden") else ""
+        vid_tag = f" videos={item.get('_video_count', 0)}" if item.get("_video_count") else ""
         print(
             f"  [{index}] sub_id={item.get('id')}, title={item.get('sub_title')}, "
             f"status={item.get('sub_status')}, begin={item.get('class_begin')}, "
             f"over={item.get('class_over')}, playback_status={item.get('playback_status')}"
+            f"{vid_tag}{hidden_tag}"
         )
     if not records and isinstance(data, dict):
         print("Subject response keys:", ", ".join(sorted(data)))
@@ -375,6 +380,135 @@ def print_video_info(data) -> str:
             if not media_url:
                 media_url = str(saved["contents"])
     return media_url
+
+
+def _time_slot_key(title: str) -> str:
+    m = re.search(r"第\d+-\d+节", title or "")
+    return m.group(0) if m else ""
+
+
+def _detect_global_step(visible_subjects: list[dict]) -> int:
+    groups: dict[str, list[int]] = {}
+    for s in visible_subjects:
+        if not isinstance(s, dict):
+            continue
+        try:
+            sid = int(s.get("id", 0))
+        except (TypeError, ValueError):
+            continue
+        if sid <= 0:
+            continue
+        key = _time_slot_key(s.get("sub_title", "") or s.get("title", ""))
+        if key:
+            groups.setdefault(key, []).append(sid)
+    for ids in groups.values():
+        if len(ids) >= 2:
+            ids_sorted = sorted(ids)
+            diffs = [b - a for a, b in zip(ids_sorted, ids_sorted[1:]) if b > a]
+            if diffs:
+                diffs.sort()
+                return diffs[len(diffs) // 2]
+    return 4
+
+
+def scan_hidden_subjects(
+    session: requests.Session, course_id: str, visible_subjects: list[dict], api_token: str,
+) -> list[dict]:
+    """Find subjects hidden by playback_status filtering via sub_id enumeration."""
+    step = _detect_global_step(visible_subjects)
+    groups: dict[str, list[int]] = {}
+    visible_ids: set[int] = set()
+    for s in visible_subjects:
+        if not isinstance(s, dict):
+            continue
+        try:
+            sid = int(s.get("id", 0))
+        except (TypeError, ValueError):
+            continue
+        if sid <= 0:
+            continue
+        visible_ids.add(sid)
+        key = _time_slot_key(s.get("sub_title", "") or s.get("title", ""))
+        groups.setdefault(key or "_unknown", []).append(sid)
+    if not groups:
+        return []
+
+    scan_starts = []
+    for slot, ids in groups.items():
+        ids.sort()
+        scan_starts.append((slot, ids[0]))
+    scan_starts.sort(key=lambda t: t[1])
+
+    debug(f"Hidden scan: global_step={step} scan_starts={scan_starts}")
+    hidden: list[dict] = []
+    seen: set[int] = set(visible_ids)
+
+    for slot, group_min in scan_starts:
+        misses = 0
+        for probe_id in range(group_min - step, max(group_min - 200, 0), -step):
+            if probe_id <= 0 or probe_id in seen:
+                continue
+            try:
+                r = course_api(
+                    session, "v3/course/get-course-sub-detail",
+                    {"course_id": course_id, "sub_id": str(probe_id)}, api_token,
+                )
+                d = r.json()
+                if not d.get("success"):
+                    misses += 1
+                    if misses >= 5:
+                        break
+                    continue
+                vd = d.get("data", d) if isinstance(d, dict) else d
+                if not isinstance(vd, dict):
+                    misses += 1
+                    continue
+                if str(vd.get("course_id", "")) != str(course_id):
+                    misses += 1
+                    continue
+                misses = 0
+                seen.add(probe_id)
+                va = vd.get("videoArr", [])
+                if not isinstance(va, list):
+                    va = []
+                pb = 0
+                sc = vd.get("sub_content")
+                if isinstance(sc, dict):
+                    pb = sc.get("playback_status", 0) or 0
+                hidden.append({
+                    "id": str(probe_id),
+                    "p_id": "0",
+                    "sub_title": vd.get("title", ""),
+                    "type": "course_live",
+                    "class_begin": "",
+                    "class_over": "",
+                    "sub_status": "6" if len(va) > 0 else "2",
+                    "click_record_num": "0",
+                    "lecturer": "",
+                    "lecturer_name": "",
+                    "is_open": "",
+                    "is_share": "",
+                    "is_export": "",
+                    "show": "yes",
+                    "is_public": "",
+                    "sub_delete": "0",
+                    "sub_review_type": "",
+                    "sub_data_id": "",
+                    "playback_status": str(pb),
+                    "olive_type": "",
+                    "precondition_time": "",
+                    "finished": 0,
+                    "_hidden": True,
+                    "_video_count": len(va),
+                })
+                debug(f"  Hidden: sub_id={probe_id} title={vd.get('title')} videos={len(va)}")
+            except Exception as e:
+                debug(f"  Probe error for {probe_id}:", e)
+                misses += 1
+            time.sleep(0.15)
+
+    hidden.sort(key=lambda s: int(s.get("id", 0)))
+    return hidden
 
 
 def safe_filename(value: str) -> str:
@@ -824,15 +958,18 @@ def main(argv: list[str] | None = None) -> int:
         )
         show_response(response, response.text)
         subject_data = json_data(response)
-        print_sub_records(subject_data)
         subject_container = subject_data
         if isinstance(subject_container, dict) and isinstance(subject_container.get("data"), dict):
             subject_container = subject_container["data"]
         subjects = subject_container.get("sub_list", []) if isinstance(subject_container, dict) else []
         if not isinstance(subjects, list):
             subjects = []
+        print("Scanning for hidden recordings...")
+        hidden_subjects = scan_hidden_subjects(session, course_id, subjects, api_token)
+        print_sub_records(subject_data, hidden_subjects)
+        all_subjects = subjects + hidden_subjects
         subject_id = select_record_value(
-            subjects,
+            all_subjects,
             "Lesson number or sub_id to inspect (empty to stop): ",
             "id",
         )
@@ -850,7 +987,7 @@ def main(argv: list[str] | None = None) -> int:
             replay_title = video_data.get("title") if isinstance(video_data, dict) else None
             if not replay_title:
                 replay_title = next(
-                    (item.get("sub_title") for item in subjects
+                    (item.get("sub_title") for item in all_subjects
                      if isinstance(item, dict) and str(item.get("id")) == subject_id),
                     subject_id,
                 )
