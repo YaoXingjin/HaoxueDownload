@@ -10,11 +10,14 @@ import shutil
 import subprocess
 import sys
 import time
+import os
+import platform
 from html.parser import HTMLParser
 from pathlib import Path
 from urllib.parse import quote, urljoin, urlsplit, urlunsplit
 
 import requests
+from cryptography.fernet import Fernet, InvalidToken
 from Crypto.Cipher import PKCS1_v1_5
 from Crypto.PublicKey import RSA
 
@@ -23,6 +26,9 @@ UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/135 Sa
 PASSPORT = "https://passport.pku.edu.cn"
 IAAA = "https://iaaa.pku.edu.cn/iaaa"
 VERBOSE = False
+AUTH_DIRECTORY_NAME = "HaoxueDownload"
+COOKIE_FILENAME = "cookies.enc"
+KEY_FILENAME = "cookies.key"
 
 
 def debug(*args, **kwargs) -> None:
@@ -115,6 +121,129 @@ def request(session: requests.Session, method: str, url: str, **kwargs) -> reque
     kwargs.setdefault("headers", {})
     kwargs["headers"].setdefault("User-Agent", UA)
     return session.request(method, url, timeout=30, allow_redirects=False, **kwargs)
+
+
+def _absolute_env_path(name: str) -> Path | None:
+    """Read a platform directory variable only when it is a valid absolute path."""
+    value = os.environ.get(name, "").strip()
+    if not value:
+        return None
+    candidate = Path(value).expanduser()
+    return candidate if candidate.is_absolute() else None
+
+
+def auth_directory() -> Path:
+    """Return the platform-standard per-user data directory.
+
+    The location is deliberately independent of the repository and current
+    working directory. Environment variables are accepted only when absolute,
+    as required by the relevant platform conventions.
+    """
+    home = Path.home()
+    system = platform.system()
+    if system == "Windows":
+        root = _absolute_env_path("LOCALAPPDATA") or (home / "AppData" / "Local")
+    elif system == "Darwin":
+        root = home / "Library" / "Application Support"
+    else:
+        root = _absolute_env_path("XDG_DATA_HOME") or (home / ".local" / "share")
+    return (root / AUTH_DIRECTORY_NAME).resolve()
+
+
+def restrict_file(path: Path) -> None:
+    """Restrict files/directories on POSIX; Windows uses the profile ACL."""
+    if os.name != "nt":
+        path.chmod(0o600)
+
+
+def prepare_auth_directory() -> Path:
+    directory = auth_directory()
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if os.name != "nt":
+        directory.chmod(0o700)
+    if not directory.is_dir():
+        raise OSError(f"authentication path is not a directory: {directory}")
+    return directory
+
+
+def auth_paths() -> tuple[Path, Path]:
+    directory = auth_directory()
+    return directory / COOKIE_FILENAME, directory / KEY_FILENAME
+
+
+def save_login_cookies(session: requests.Session) -> bool:
+    """Store encrypted session cookies in the per-user data directory."""
+    try:
+        cookies = [
+            {
+                "name": cookie.name,
+                "value": cookie.value,
+                "domain": cookie.domain,
+                "path": cookie.path,
+                "expires": cookie.expires,
+                "secure": cookie.secure,
+            }
+            for cookie in session.cookies
+        ]
+        cookie_path, key_path = auth_paths()
+        prepare_auth_directory()
+        if not key_path.exists():
+            key_path.write_bytes(Fernet.generate_key())
+            restrict_file(key_path)
+        key = key_path.read_bytes()
+        encrypted = Fernet(key).encrypt(json.dumps(cookies, separators=(",", ":")).encode())
+        temporary = cookie_path.with_name(cookie_path.name + ".tmp")
+        temporary.write_bytes(encrypted)
+        restrict_file(temporary)
+        temporary.replace(cookie_path)
+        restrict_file(cookie_path)
+        return True
+    except Exception as exc:
+        debug("Could not save encrypted login state:", type(exc).__name__, str(exc)[:160])
+        return False
+
+
+def load_login_cookies(session: requests.Session) -> bool:
+    """Restore encrypted session cookies from the per-user data directory."""
+    try:
+        cookie_path, key_path = auth_paths()
+        if not cookie_path.is_file() or not key_path.is_file():
+            return False
+        records = json.loads(Fernet(key_path.read_bytes()).decrypt(cookie_path.read_bytes()).decode())
+        if not isinstance(records, list):
+            return False
+        for record in records:
+            if not isinstance(record, dict) or not record.get("name"):
+                continue
+            cookie_kwargs = {
+                "path": str(record.get("path", "/")),
+                "expires": record.get("expires"),
+                "secure": bool(record.get("secure", False)),
+            }
+            if record.get("domain"):
+                cookie_kwargs["domain"] = str(record["domain"])
+            session.cookies.set(
+                str(record["name"]), str(record.get("value", "")), **cookie_kwargs
+            )
+        return bool(session.cookies)
+    except (InvalidToken, OSError, ValueError, TypeError) as exc:
+        debug("Could not load encrypted login state:", type(exc).__name__)
+        return False
+
+
+def saved_login_is_valid(session: requests.Session) -> bool:
+    """Validate a restored cookie jar against the authenticated course API."""
+    api_token = next((c.value for c in session.cookies if c.name == "_token2"), "")
+    if not api_token:
+        return False
+    response = course_api(session, "v3/course/get-use-member", {"page": "1"}, api_token)
+    if not response.ok:
+        return False
+    try:
+        value = response.json()
+    except ValueError:
+        return False
+    return isinstance(value, dict) and value.get("success") is not False
 
 
 def api_sign(params: dict[str, str]) -> str:
@@ -569,6 +698,15 @@ def main(argv: list[str] | None = None) -> int:
     VERBOSE = args.verbose
     session = requests.Session()
 
+    restore = input("Use the last saved login session? [Y/n]: ").strip().lower()
+    restored = restore not in {"n", "no"}
+    if restored:
+        restored = load_login_cookies(session) and saved_login_is_valid(session)
+        if restored:
+            print("Restored the saved login session.")
+        else:
+            print("No valid saved login session; starting a new login.")
+
     debug("== 1. Passport entry ==")
     response = request(
         session,
@@ -598,46 +736,52 @@ def main(argv: list[str] | None = None) -> int:
     key_data = response.json()
     public_key = RSA.import_key(key_data["key"])
 
-    account = input("Account: ")
-    password = getpass.getpass("Password: ")
-    encrypted = PKCS1_v1_5.new(public_key).encrypt(password.encode("utf-8"))
-    password = ""
+    if not restored:
+        account = input("Account: ")
+        password = getpass.getpass("Password: ")
+        encrypted = PKCS1_v1_5.new(public_key).encrypt(password.encode("utf-8"))
+        password = ""
 
-    debug("== 4. IAAA login (credentials are not printed) ==")
-    login_form = {
-        "appid": appid,
-        "userName": account,
-        "password": base64.b64encode(encrypted).decode("ascii"),
-        "randCode": "",
-        "smsCode": "",
-        "otpCode": "",
-        "remTrustChk": "false",
-        "redirUrl": oauth_form["redirectUrl"],
-    }
-    response = request(session, "POST", IAAA + "/oauthlogin.do", data=login_form)
-    body = response.text
-    show_response(response, body)
-    result = response.json()
-    if not result.get("success"):
-        print("Login did not succeed. Paste this output only.")
-        return 2
+    if not restored:
+        debug("== 4. IAAA login (credentials are not printed) ==")
+        login_form = {
+            "appid": appid,
+            "userName": account,
+            "password": base64.b64encode(encrypted).decode("ascii"),
+            "randCode": "",
+            "smsCode": "",
+            "otpCode": "",
+            "remTrustChk": "false",
+            "redirUrl": oauth_form["redirectUrl"],
+        }
+        response = request(session, "POST", IAAA + "/oauthlogin.do", data=login_form)
+        body = response.text
+        show_response(response, body)
+        result = response.json()
+        if not result.get("success"):
+            print("Login did not succeed. Paste this output only.")
+            return 2
 
-    token = str(result.get("token", ""))
-    debug(f"IAAA token received: yes (length {len(token)}, value hidden)")
+        token = str(result.get("token", ""))
+        debug(f"IAAA token received: yes (length {len(token)}, value hidden)")
 
-    callback = PASSPORT + "/?_rand=debug&token=" + quote(token, safe="")
-    debug("== 5. Passport token callback ==")
-    response = request(session, "GET", callback)
-    callback_body = response.text
-    show_response(response, callback_body)
-    debug("Callback contains PKULoginSuccess:", "PKULoginSuccess" in callback_body)
-    debug("Final session cookie metadata:")
-    for cookie in sorted(session.cookies, key=lambda c: c.name):
+        callback = PASSPORT + "/?_rand=debug&token=" + quote(token, safe="")
+        debug("== 5. Passport token callback ==")
+        response = request(session, "GET", callback)
+        callback_body = response.text
+        show_response(response, callback_body)
+        debug("Callback contains PKULoginSuccess:", "PKULoginSuccess" in callback_body)
+        debug("Final session cookie metadata:")
+        for cookie in sorted(session.cookies, key=lambda c: c.name):
             debug(
-            f"  {cookie.name}: length={len(cookie.value)}, "
-            f"domain={cookie.domain}, path={cookie.path}, secure={cookie.secure}"
-        )
-    show_callback_clues(callback_body)
+                f"  {cookie.name}: length={len(cookie.value)}, "
+                f"domain={cookie.domain}, path={cookie.path}, secure={cookie.secure}"
+            )
+        show_callback_clues(callback_body)
+        if save_login_cookies(session):
+            print(f"Encrypted login state saved locally: {auth_directory()}")
+        else:
+            print("Could not save encrypted login state; login state was not saved.")
     debug("== 6. Authenticated course API probe ==")
     api_params = {
         "page": "1",
